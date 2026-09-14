@@ -1,0 +1,17 @@
+{
+  "name": "ring-of-12-api",
+  "version": "1.0.0",
+  "description": "Ring of 12 \u2014 12 archetype AI perspectives + Agent Zero synthesis",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
+  }
+}

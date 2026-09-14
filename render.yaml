@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ring-of-12-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: EMERGENT_LLM_KEY
+        sync: false
+      - key: PORT
+        value: "3000"
