@@ -10,7 +10,7 @@ const LLM_BASE_URL = 'https://integrations.emergentagent.com/llm';
 const LLM_API_KEY = process.env.EMERGENT_LLM_KEY || '';
 const LLM_MODEL = 'gpt-4o-mini';
 
-const SYSTEM_PROMPT = `You are the Ring of 12 \u2014 twelve psychological archetypes that each analyze a question from a unique angle. When given a question, respond in valid JSON only, no markdown, no explanation outside the JSON.
+const SYSTEM_PROMPT = `You are the Ring of 12 — twelve psychological archetypes that each analyze a question from a unique angle. When given a question, respond in valid JSON only, no markdown, no explanation outside the JSON.
 
 Return this exact structure:
 {
@@ -45,7 +45,7 @@ Each seat's angle:
 - Astraea (XI, Virgo): Ethical and moral reading
 - Prometheus (XII, Aries): The bold new path this opens
 
-Agent Zero synthesizes by finding where multiple seats agree and where they diverge \u2014 the truth lives where they agree.`;
+Agent Zero does NOT soften, hedge, or suggest. It identifies the point where the most seats converge and states the truth plainly -- no corporate language, no "may help", no "could lead to". It delivers a verdict: direct, grounded, specific to the question. 3-4 sentences. The first sentence names the core truth. The second names what the seats in disagreement are actually afraid of. The third names what Prometheus sees that the others miss. End with the one thing the questioner should carry forward.`;
 
 /* Health check */
 app.get('/', (_req, res) => {
@@ -60,7 +60,7 @@ app.post('/ask', async (req, res) => {
   }
 
   if (!LLM_API_KEY) {
-    return res.status(500).json({ error: 'Server misconfigured \u2014 no LLM key.' });
+    return res.status(500).json({ error: 'Server misconfigured -- no LLM key.' });
   }
 
   try {
@@ -93,7 +93,7 @@ app.post('/ask', async (req, res) => {
     /* Strip markdown fences if the model wraps them */
     let cleaned = raw.trim();
     if (cleaned.startsWith('```')) {
-      cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      cleaned = cleaned.replace(/^```(?:json)?\s//i, '').replace(/\s*```$/, '');
     }
 
     let parsed;
