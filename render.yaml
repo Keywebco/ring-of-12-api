@@ -5,6 +5,10 @@ services:
     buildCommand: npm install
     startCommand: node server.js
     envVars:
+      # REQUIRED: server.js reads LLM_API_KEY. Set the Emergent universal key here.
+      - key: LLM_API_KEY
+        sync: false
+      # Legacy name, kept for backward compatibility only. server.js does NOT read it.
       - key: EMERGENT_LLM_KEY
         sync: false
       - key: PORT
