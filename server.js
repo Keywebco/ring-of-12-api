@@ -29,7 +29,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const LLM_BASE_URL = 'https://integrations.emergentagent.com/llm';
+const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://integrations.emergentagent.com/llm';
 
 /* REQUIRED — never hardcode the key in this file. See header note about the
  * previously leaked key: it must be rotated in the Emergent dashboard. */
@@ -123,18 +123,82 @@ function validQuestion(q) {
   return typeof q === 'string' && !!q.trim() && q.trim().length <= 2000;
 }
 
+
+/* ── Free-question gate ──────────────────────────────────────────────────
+ * Every visitor gets FREE_LIMIT free Ring runs on the Federation key, counted
+ * per IP address (a client-side counter is trivially cleared, so it is never
+ * trusted). After that the page asks for the visitor's own key (used in their
+ * browser, never sent here) or a paid plan. A global daily cap protects the
+ * Federation's balance from a flood. The Owner token (OWNER_TOKEN env) skips
+ * the gate for Roger and the Federation's own testing.
+ * Honest limit: counts live in memory, so a restart or free-tier spin-down
+ * resets them; people behind one shared IP share one allowance. */
+const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '3', 10);
+const FREE_DAILY_CAP = parseInt(process.env.FREE_DAILY_CAP || '300', 10);
+const OWNER_TOKEN = process.env.OWNER_TOKEN || '';
+const SUBSCRIBE_URL = process.env.SUBSCRIBE_URL || '';
+const usage = new Map();
+const globalUse = { day: '', count: 0 };
+function today() { return new Date().toISOString().slice(0, 10); }
+function clientIp(req) { return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown'; }
+function isOwner(req) {
+  const t = req.get('x-owner-token') || '';
+  return !!OWNER_TOKEN && t.length === OWNER_TOKEN.length && require('crypto').timingSafeEqual(Buffer.from(t), Buffer.from(OWNER_TOKEN));
+}
+function usageFor(ip) {
+  const d = today();
+  let u = usage.get(ip);
+  if (!u || u.day !== d) { u = { day: d, asks: 0, singles: 0 }; usage.set(ip, u); }
+  if (usage.size > 20000) { for (const [k, v] of usage) if (v.day !== d) usage.delete(k); }
+  return u;
+}
+function globalToday() {
+  const d = today();
+  if (globalUse.day !== d) { globalUse.day = d; globalUse.count = 0; }
+  return globalUse;
+}
+function quotaBody(req) {
+  const u = usageFor(clientIp(req));
+  return { freeLimit: FREE_LIMIT, used: u.asks, remaining: Math.max(0, FREE_LIMIT - u.asks), owner: isOwner(req), subscribeUrl: SUBSCRIBE_URL || null };
+}
+function gate(kind) {
+  return (req, res, next) => {
+    if (isOwner(req)) return next();
+    const u = usageFor(clientIp(req));
+    if (kind === 'ask') {
+      if (u.asks >= FREE_LIMIT) {
+        return res.status(402).json({ error: 'free_limit', message: 'Your ' + FREE_LIMIT + ' free questions are used. Add your own API key to keep going' + (SUBSCRIBE_URL ? ', or subscribe.' : '.'), freeLimit: FREE_LIMIT, used: u.asks, remaining: 0, subscribeUrl: SUBSCRIBE_URL || null });
+      }
+      if (globalToday().count >= FREE_DAILY_CAP) {
+        return res.status(503).json({ error: 'daily_cap', message: 'The free allowance for today is used up. Add your own API key to keep going.', subscribeUrl: SUBSCRIBE_URL || null });
+      }
+    } else if (u.asks < 1 || u.singles >= FREE_LIMIT) {
+      return res.status(402).json({ error: 'free_limit', message: 'The comparison needs a free Ring question first, and is limited to ' + FREE_LIMIT + ' a day.', freeLimit: FREE_LIMIT });
+    }
+    next();
+  };
+}
+function countUse(req, kind) {
+  if (isOwner(req)) return;
+  const u = usageFor(clientIp(req));
+  if (kind === 'ask') { u.asks += 1; globalToday().count += 1; } else { u.singles += 1; }
+}
+
+app.get('/quota', (req, res) => res.json(quotaBody(req)));
+
 /* ── Health check ── */
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'Ring of 12',
-    endpoints: ['/ask', '/single', '/log'],
+    endpoints: ['/ask', '/single', '/log', '/quota'],
+    freeLimit: FREE_LIMIT,
     llmConfigured: !!LLM_API_KEY
   });
 });
 
 /* ── Full Ring run ── */
-app.post('/ask', async (req, res) => {
+app.post('/ask', gate('ask'), async (req, res) => {
   const { question } = req.body || {};
   if (!validQuestion(question)) {
     return res.status(400).json({ error: 'Missing or empty "question" field (max 2000 chars).' });
@@ -160,6 +224,8 @@ app.post('/ask', async (req, res) => {
       return res.status(502).json({ error: 'LLM returned incomplete structure.', raw: parsed });
     }
 
+    countUse(req, 'ask');
+    parsed.quota = quotaBody(req);
     return res.json(parsed);
   } catch (err) {
     console.error('Server error:', err.status || '', err.detail || err.message || err);
@@ -168,7 +234,7 @@ app.post('/ask', async (req, res) => {
 });
 
 /* ── Single-perspective answer (singularity comparison) ── */
-app.post('/single', async (req, res) => {
+app.post('/single', gate('single'), async (req, res) => {
   const { question } = req.body || {};
   if (!validQuestion(question)) {
     return res.status(400).json({ error: 'Missing or empty "question" field (max 2000 chars).' });
@@ -180,6 +246,7 @@ app.post('/single', async (req, res) => {
 
   try {
     const answer = await callLLM(SINGLE_SYSTEM_PROMPT, question.trim(), { temperature: 0.7, maxTokens: 400 });
+    countUse(req, 'single');
     return res.json({ answer: answer.trim() });
   } catch (err) {
     console.error('Single-answer error:', err.status || '', err.detail || err.message || err);
@@ -245,3 +312,4 @@ app.post('/log', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Ring of 12 API listening on port ${PORT}`);
 });
+module.exports = app;
