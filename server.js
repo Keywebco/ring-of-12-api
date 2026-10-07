@@ -422,18 +422,38 @@ app.post('/council', gate('ask'), async (req, res) => {
     clean.push({ id: st.id, name: String(st.name || st.id).slice(0, 40), role: String(st.role || '').slice(0, 300) });
   }
   if (!buildProviders().length) return res.status(500).json({ error: 'Server misconfigured: no model provider.' });
-  const roster = clean.map((c) => '- ' + c.id + ' (' + c.name + '): ' + c.role).join('\n');
+  const roster = clean.map((c) => '- id "' + c.id + '" = ' + c.name + ': ' + c.role).join('\n');
   const system = 'You run a deliberation council. Answer the question once for EACH seat below, in that seat\'s own voice and perspective, each in 60 words or fewer. ' +
     'Seats may disagree; keep real disagreement. Label claims honestly: say when something is uncertain. No flattery, no pressure language. ' +
-    'Reply with JSON only, no other text, shaped exactly like {"answers":{"<seat id>":"<answer>"}} with every seat id present.\n\nSEATS:\n' + roster;
+    'Reply with JSON only, no other text, shaped exactly like {"answers":{"<seat id>":"<answer>"}}. Use each seat id EXACTLY as written inside the quotes (for example "roger-ai"), never add the name to the key. Every seat id must be present.\n\nSEATS:\n' + roster;
   try {
-    const raw = await callLLM(system, 'QUESTION: ' + question.trim(), { temperature: 0.7, maxTokens: 1400 });
-    const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
-    if (a < 0 || b < a) throw new Error('no JSON');
-    const parsed = JSON.parse(raw.slice(a, b + 1));
-    const answers = {};
-    for (const c of clean) answers[c.id] = String((parsed.answers && parsed.answers[c.id]) || '').slice(0, 900);
-    if (!Object.values(answers).some((v) => v.trim())) throw new Error('empty answers');
+    const wanted = clean.map((c) => c.id);
+    const norm = (k) => String(k || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const pick = (obj, id) => {
+      if (!obj || typeof obj !== 'object') return '';
+      if (typeof obj[id] === 'string') return obj[id];
+      const want = norm(id);
+      for (const k of Object.keys(obj)) { const nk = norm(k); if (nk === want || nk.startsWith(want)) return typeof obj[k] === 'string' ? obj[k] : ''; }
+      return '';
+    };
+    const parseLoose = (raw) => {
+      const a0 = raw.indexOf('{'); if (a0 < 0) return null;
+      let t = raw.slice(a0, raw.lastIndexOf('}') + 1);
+      try { return JSON.parse(t); } catch (e) { /* try to repair a cut-off reply below */ }
+      let cut = raw.slice(a0).replace(/,\s*"[^"]*"\s*:\s*"[^"]*$/, '').replace(/"[^"]*$/, '');
+      if (!/}\s*}?\s*$/.test(cut)) cut = cut.replace(/,\s*$/, '') + '"}}';
+      try { return JSON.parse(cut); } catch (e) { return null; }
+    };
+    let answers = null;
+    for (let attempt = 0; attempt < 2 && !answers; attempt++) {
+      const raw = await callLLM(system, 'QUESTION: ' + question.trim(), { temperature: attempt ? 0.3 : 0.7, maxTokens: 1600 });
+      const parsed = parseLoose(raw);
+      const body = parsed && (parsed.answers || parsed);
+      const got = {};
+      for (const id of wanted) got[id] = String(pick(body, id) || '').slice(0, 900);
+      if (Object.values(got).some((v) => v.trim())) answers = got;
+    }
+    if (!answers) throw new Error('empty answers');
     countUse(req, 'ask');
     return res.json({ answers, quota: quotaBody(req), provider: lastProvider });
   } catch (err) {
