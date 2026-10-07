@@ -205,6 +205,55 @@ function globalToday() {
   if (globalUse.day !== d) { globalUse.day = d; globalUse.count = 0; }
   return globalUse;
 }
+
+/* ── Paid members (Gumroad subscriptions) ────────────────────────────────
+ * A subscriber sends their Gumroad license key in the x-license-key header. The server asks Gumroad
+ * whether the key is real, belongs to one of our three membership products, and is still in good
+ * standing (not refunded, charged back, cancelled or failed). The tier sets a DAILY allowance.
+ * Nothing about a member is stored except a per-day counter keyed by a hash of the license key.
+ * Gumroad is the source of truth: if Gumroad says no, the answer is no. A positive answer is cached
+ * for 10 minutes so each question does not cost a Gumroad call. */
+const TIERS = {
+  ophtywm: { name: 'Federation Entry: The Inner Ring (Starter)', daily: 2 },
+  dqyabh:  { name: "The Scholar's Ledger: Advanced Ring Access", daily: 5 },
+  xctpus:  { name: "The Architect's Covenant: 200-Year Legacy Pass", daily: 15 }
+};
+const memberCache = new Map();      // key-hash -> { until, tier }
+const memberUse = new Map();        // key-hash -> { day, n }
+const sha = (t) => require('crypto').createHash('sha256').update(String(t)).digest('hex').slice(0, 24);
+
+async function verifyMember(licenseKey) {
+  const key = String(licenseKey || '').trim();
+  if (key.length < 8 || key.length > 80 || !/^[A-Za-z0-9\-_]+$/.test(key)) return null;
+  const h = sha(key);
+  const hit = memberCache.get(h);
+  if (hit && hit.until > Date.now()) return { h, tier: hit.tier };
+  for (const code of Object.keys(TIERS)) {
+    try {
+      const r = await fetch((process.env.GUMROAD_VERIFY_URL || 'https://api.gumroad.com/v2/licenses/verify'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ product_permalink: code, license_key: key, increment_uses_count: 'false' })
+      });
+      if (r.status !== 200) continue;
+      const d = await r.json();
+      if (!d || !d.success) continue;
+      const pu = d.purchase || {};
+      if (pu.refunded || pu.chargebacked || pu.disputed) return null;
+      if (pu.subscription_cancelled_at || pu.subscription_failed_at || pu.subscription_ended_at) return null;
+      memberCache.set(h, { until: Date.now() + 10 * 60 * 1000, tier: code });
+      return { h, tier: code };
+    } catch (e) { /* try next tier code */ }
+  }
+  return null;
+}
+function memberLeft(m) {
+  const d = today();
+  let u = memberUse.get(m.h);
+  if (!u || u.day !== d) { u = { day: d, n: 0 }; memberUse.set(m.h, u); }
+  return { used: u.n, daily: TIERS[m.tier].daily, remaining: Math.max(0, TIERS[m.tier].daily - u.n), rec: u };
+}
+
 function quotaBody(req) {
   const u = usageFor(clientIp(req));
   return { freeLimit: FREE_LIMIT,
@@ -213,8 +262,17 @@ function quotaBody(req) {
     providerFails, used: u.asks, remaining: Math.max(0, FREE_LIMIT - u.asks), owner: isOwner(req), subscribeUrl: SUBSCRIBE_URL || null };
 }
 function gate(kind) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     if (isOwner(req)) return next();
+    const lk = req.get('x-license-key');
+    if (lk) {
+      const m = await verifyMember(lk);
+      if (!m) return res.status(401).json({ error: 'bad_license', message: 'That license key is not an active membership. Check it, or use your own API key.' });
+      const l = memberLeft(m);
+      if (l.remaining <= 0) return res.status(429).json({ error: 'member_daily', message: 'You have used your ' + l.daily + ' daily questions for the ' + TIERS[m.tier].name + '. They renew tomorrow, or add your own API key to keep going.', daily: l.daily, used: l.used, remaining: 0 });
+      req.member = m;
+      return next();
+    }
     const u = usageFor(clientIp(req));
     if (kind === 'ask') {
       if (u.asks >= FREE_LIMIT) {
@@ -231,11 +289,21 @@ function gate(kind) {
 }
 function countUse(req, kind) {
   if (isOwner(req)) return;
+  if (req.member) { memberLeft(req.member).rec.n += 1; return; }
   const u = usageFor(clientIp(req));
   if (kind === 'ask') { u.asks += 1; globalToday().count += 1; } else { u.singles += 1; }
 }
 
-app.get('/quota', (req, res) => res.json(quotaBody(req)));
+app.get('/quota', async (req, res) => {
+  const body = quotaBody(req);
+  const lk = req.get('x-license-key');
+  if (lk) {
+    const m = await verifyMember(lk);
+    if (m) { const l = memberLeft(m); body.member = { tier: TIERS[m.tier].name, daily: l.daily, used: l.used, remaining: l.remaining }; }
+    else body.member = { error: 'That license key is not an active membership.' };
+  }
+  res.json(body);
+});
 
 /* ── Health check ── */
 app.get('/', (_req, res) => {
