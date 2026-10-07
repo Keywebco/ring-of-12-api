@@ -34,7 +34,9 @@ const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://integrations.emergenta
 /* REQUIRED — never hardcode the key in this file. See header note about the
  * previously leaked key: it must be rotated in the Emergent dashboard. */
 const LLM_API_KEY = process.env.LLM_API_KEY || '';
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = process.env.LLM_MODEL || 'gpt-4o-mini';
+/* LLM_CHAT_PATH lets the same server talk to any OpenAI-compatible provider (MiMo uses /v1/chat/completions). */
+const LLM_CHAT_PATH = process.env.LLM_CHAT_PATH || '/v1/chat/completions';
 
 if (!LLM_API_KEY) {
   console.warn('WARNING: LLM_API_KEY is not set — /ask and /single will return 500 until it is configured.');
@@ -81,7 +83,7 @@ const SINGLE_SYSTEM_PROMPT = 'Answer the question directly in 3-4 sentences, sin
 
 /* ── Shared LLM call ── */
 async function callLLM(systemPrompt, userContent, opts) {
-  const llmRes = await fetch(`${LLM_BASE_URL}/v1/chat/completions`, {
+  const llmRes = await fetch(`${LLM_BASE_URL}${LLM_CHAT_PATH}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
