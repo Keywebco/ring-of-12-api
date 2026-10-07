@@ -81,35 +81,73 @@ Agent Zero does NOT soften, hedge, or suggest. It identifies the point where the
 
 const SINGLE_SYSTEM_PROMPT = 'Answer the question directly in 3-4 sentences, single perspective, no archetypes.';
 
-/* ── Shared LLM call ── */
-async function callLLM(systemPrompt, userContent, opts) {
-  const llmRes = await fetch(`${LLM_BASE_URL}${LLM_CHAT_PATH}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${LLM_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent }
-      ],
-      temperature: (opts && opts.temperature) || 0.8,
-      max_tokens: (opts && opts.maxTokens) || 3000
-    })
-  });
-
-  if (!llmRes.ok) {
-    const errText = await llmRes.text();
-    const err = new Error('LLM API error');
-    err.status = llmRes.status;
-    err.detail = errText;
-    throw err;
+/* ── Shared LLM call, with automatic fallback ──────────────────────────────
+ * Providers are tried in order. Any failure (network error, non-200, empty reply, timeout)
+ * moves on to the next one, so a visitor only sees an error when EVERY provider is down.
+ * Order: 1) MiMo (the free primary)  2) Fireworks (prepaid backup)  3) Emergent (kept as the last backup).
+ * A provider is skipped when its key is not set. Keys are read from environment variables only.
+ * The last provider that answered is exposed as lastProvider for health checks. */
+function buildProviders() {
+  const list = [];
+  if (process.env.LLM_API_KEY) {
+    list.push({ name: process.env.LLM_PROVIDER_NAME || 'primary', base: LLM_BASE_URL, path: LLM_CHAT_PATH, key: process.env.LLM_API_KEY, model: LLM_MODEL });
   }
+  if (process.env.FIREWORKS_API_KEY) {
+    list.push({ name: 'fireworks', base: 'https://api.fireworks.ai/inference', path: '/v1/chat/completions', key: process.env.FIREWORKS_API_KEY, model: process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/gpt-oss-120b' });
+  }
+  if (process.env.EMERGENT_LLM_KEY) {
+    list.push({ name: 'emergent', base: 'https://integrations.emergentagent.com/llm', path: '/v1/chat/completions', key: process.env.EMERGENT_LLM_KEY, model: 'gpt-4o-mini' });
+  }
+  return list;
+}
+const PROVIDER_TIMEOUT_MS = parseInt(process.env.PROVIDER_TIMEOUT_MS || '70000', 10);
+let lastProvider = null;
+const providerFails = {};
 
-  const llmData = await llmRes.json();
-  return (llmData.choices && llmData.choices[0] && llmData.choices[0].message && llmData.choices[0].message.content) || '';
+async function callOne(pv, systemPrompt, userContent, opts) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PROVIDER_TIMEOUT_MS);
+  try {
+    const llmRes = await fetch(`${pv.base}${pv.path}`, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${pv.key}` },
+      body: JSON.stringify({
+        model: pv.model,
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
+        temperature: (opts && opts.temperature) != null ? opts.temperature : 0.8,
+        max_tokens: (opts && opts.maxTokens) || 3000
+      })
+    });
+    if (!llmRes.ok) {
+      const err = new Error('LLM API error');
+      err.status = llmRes.status;
+      err.detail = (await llmRes.text()).slice(0, 200);
+      throw err;
+    }
+    const d = await llmRes.json();
+    const text = (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '';
+    if (!text.trim()) { const e = new Error('empty reply'); e.status = 0; throw e; }
+    return text;
+  } finally { clearTimeout(timer); }
+}
+
+async function callLLM(systemPrompt, userContent, opts) {
+  const chain = buildProviders();
+  if (!chain.length) { const e = new Error('no provider configured'); e.status = 500; throw e; }
+  let lastErr = null;
+  for (const pv of chain) {
+    try {
+      const text = await callOne(pv, systemPrompt, userContent, opts);
+      lastProvider = pv.name;
+      return text;
+    } catch (err) {
+      providerFails[pv.name] = (providerFails[pv.name] || 0) + 1;
+      console.error('Provider failed:', pv.name, err.status || '', err.name === 'AbortError' ? 'timeout' : (err.detail || err.message));
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 /* Strip markdown fences if the model wraps the JSON in them. */
@@ -169,7 +207,10 @@ function globalToday() {
 }
 function quotaBody(req) {
   const u = usageFor(clientIp(req));
-  return { freeLimit: FREE_LIMIT, used: u.asks, remaining: Math.max(0, FREE_LIMIT - u.asks), owner: isOwner(req), subscribeUrl: SUBSCRIBE_URL || null };
+  return { freeLimit: FREE_LIMIT,
+    providers: buildProviders().map(p => p.name),
+    lastProvider,
+    providerFails, used: u.asks, remaining: Math.max(0, FREE_LIMIT - u.asks), owner: isOwner(req), subscribeUrl: SUBSCRIBE_URL || null };
 }
 function gate(kind) {
   return (req, res, next) => {
@@ -236,6 +277,7 @@ app.post('/ask', gate('ask'), async (req, res) => {
 
     countUse(req, 'ask');
     parsed.quota = quotaBody(req);
+    parsed.provider = lastProvider;
     return res.json(parsed);
   } catch (err) {
     console.error('Server error:', err.status || '', err.detail || err.message || err);
@@ -286,7 +328,7 @@ app.post('/complete', gate('ask'), async (req, res) => {
       messages.filter((m, i) => !(i === 0 && m.role === 'system')).map((m) => m.content).join('\n\n'),
       { temperature: 0, maxTokens: Math.min(parseInt(maxTokens || 900, 10) || 900, 1200) });
     countUse(req, 'ask');
-    return res.json({ text, quota: quotaBody(req) });
+    return res.json({ text, quota: quotaBody(req), provider: lastProvider });
   } catch (err) {
     console.error('Complete error:', err.status || '', err.detail || err.message || err);
     return res.status(err.status ? 502 : 500).json({ error: 'LLM request failed.' });
