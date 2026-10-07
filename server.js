@@ -142,7 +142,15 @@ const SUBSCRIBE_URL = process.env.SUBSCRIBE_URL || '';
 const usage = new Map();
 const globalUse = { day: '', count: 0 };
 function today() { return new Date().toISOString().slice(0, 10); }
-function clientIp(req) { return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown'; }
+/* Render sits behind Cloudflare, so req.ip is a rotating Cloudflare edge address. The visitor's real address
+ * is in CF-Connecting-IP (set by Cloudflare, which overwrites anything a client sends). Fall back to the
+ * left-most X-Forwarded-For entry, then to req.ip. */
+function clientIp(req) {
+  const cf = (req.get('cf-connecting-ip') || '').trim();
+  if (cf) return cf;
+  const xf = (req.get('x-forwarded-for') || '').split(',')[0].trim();
+  return xf || req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+}
 function isOwner(req) {
   const t = req.get('x-owner-token') || '';
   return !!OWNER_TOKEN && t.length === OWNER_TOKEN.length && require('crypto').timingSafeEqual(Buffer.from(t), Buffer.from(OWNER_TOKEN));
