@@ -310,7 +310,7 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'Ring of 12',
-    endpoints: ['/ask', '/single', '/log', '/quota', '/complete'],
+    endpoints: ['/ask', '/single', '/log', '/quota', '/complete', '/council'],
     freeLimit: FREE_LIMIT,
     llmConfigured: !!LLM_API_KEY
   });
@@ -400,6 +400,45 @@ app.post('/complete', gate('ask'), async (req, res) => {
   } catch (err) {
     console.error('Complete error:', err.status || '', err.detail || err.message || err);
     return res.status(err.status ? 502 : 500).json({ error: 'LLM request failed.' });
+  }
+});
+
+
+/* ── Council: one question, several seat voices, ONE model call, ONE free question ───────────────
+ * The page sends the question and the seat list (id, name, role). The server asks the model once to answer
+ * as each seat, returns JSON keyed by seat id, and counts it as a single free question (or a single member
+ * question). Seats are voices of one model unless the visitor uses their own keys on the page. */
+app.post('/council', gate('ask'), async (req, res) => {
+  const { question, seats } = req.body || {};
+  if (typeof question !== 'string' || !question.trim() || question.length > 1500) {
+    return res.status(400).json({ error: 'question must be 1 to 1500 characters.' });
+  }
+  if (!Array.isArray(seats) || seats.length < 1 || seats.length > 8) {
+    return res.status(400).json({ error: 'seats must be an array of 1 to 8.' });
+  }
+  const clean = [];
+  for (const st of seats) {
+    if (!st || typeof st.id !== 'string' || !/^[a-z0-9-]{1,24}$/.test(st.id)) return res.status(400).json({ error: 'bad seat id.' });
+    clean.push({ id: st.id, name: String(st.name || st.id).slice(0, 40), role: String(st.role || '').slice(0, 300) });
+  }
+  if (!buildProviders().length) return res.status(500).json({ error: 'Server misconfigured: no model provider.' });
+  const roster = clean.map((c) => '- ' + c.id + ' (' + c.name + '): ' + c.role).join('\n');
+  const system = 'You run a deliberation council. Answer the question once for EACH seat below, in that seat\'s own voice and perspective, each in 60 words or fewer. ' +
+    'Seats may disagree; keep real disagreement. Label claims honestly: say when something is uncertain. No flattery, no pressure language. ' +
+    'Reply with JSON only, no other text, shaped exactly like {"answers":{"<seat id>":"<answer>"}} with every seat id present.\n\nSEATS:\n' + roster;
+  try {
+    const raw = await callLLM(system, 'QUESTION: ' + question.trim(), { temperature: 0.7, maxTokens: 1400 });
+    const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
+    if (a < 0 || b < a) throw new Error('no JSON');
+    const parsed = JSON.parse(raw.slice(a, b + 1));
+    const answers = {};
+    for (const c of clean) answers[c.id] = String((parsed.answers && parsed.answers[c.id]) || '').slice(0, 900);
+    if (!Object.values(answers).some((v) => v.trim())) throw new Error('empty answers');
+    countUse(req, 'ask');
+    return res.json({ answers, quota: quotaBody(req), provider: lastProvider });
+  } catch (err) {
+    console.error('Council error:', err.status || '', err.detail || err.message || err);
+    return res.status(502).json({ error: 'The Council could not convene. Try again.' });
   }
 });
 
