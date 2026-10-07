@@ -191,7 +191,7 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'Ring of 12',
-    endpoints: ['/ask', '/single', '/log', '/quota'],
+    endpoints: ['/ask', '/single', '/log', '/quota', '/complete'],
     freeLimit: FREE_LIMIT,
     llmConfigured: !!LLM_API_KEY
   });
@@ -250,6 +250,35 @@ app.post('/single', gate('single'), async (req, res) => {
     return res.json({ answer: answer.trim() });
   } catch (err) {
     console.error('Single-answer error:', err.status || '', err.detail || err.message || err);
+    return res.status(err.status ? 502 : 500).json({ error: 'LLM request failed.' });
+  }
+});
+
+
+/* ── Free completion for the source-check (counts as one free question) ──
+ * Same per-IP allowance as /ask. Input is size-capped so it cannot be used as a general-purpose proxy. */
+app.post('/complete', gate('ask'), async (req, res) => {
+  const { messages, maxTokens } = req.body || {};
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 4) {
+    return res.status(400).json({ error: 'messages must be an array of 1 to 4 items.' });
+  }
+  let total = 0;
+  for (const m of messages) {
+    if (!m || typeof m.content !== 'string' || !['system', 'user'].includes(m.role)) {
+      return res.status(400).json({ error: 'each message needs role system|user and string content.' });
+    }
+    total += m.content.length;
+  }
+  if (total > 9000) return res.status(400).json({ error: 'input too long (9000 chars max).' });
+  if (!LLM_API_KEY) return res.status(500).json({ error: 'Server misconfigured -- LLM_API_KEY is not set.' });
+  try {
+    const text = await callLLM(messages[0].role === 'system' ? messages[0].content : 'Answer carefully.',
+      messages.filter((m, i) => !(i === 0 && m.role === 'system')).map((m) => m.content).join('\n\n'),
+      { temperature: 0, maxTokens: Math.min(parseInt(maxTokens || 900, 10) || 900, 1200) });
+    countUse(req, 'ask');
+    return res.json({ text, quota: quotaBody(req) });
+  } catch (err) {
+    console.error('Complete error:', err.status || '', err.detail || err.message || err);
     return res.status(err.status ? 502 : 500).json({ error: 'LLM request failed.' });
   }
 });
