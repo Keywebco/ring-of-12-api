@@ -473,40 +473,66 @@ const LIBRARY_FREE = parseInt(process.env.LIBRARY_FREE || '3', 10);
 const LIBRARY_PRODUCT = process.env.LIBRARY_PRODUCT_PERMALINK || '';
 const libUse = new Map();
 const libCodeCache = new Map();
-async function verifyLibraryCode(code) {
+/* A Supporter Key is a Gumroad license key, one per sale. It works on up to LIBRARY_DEVICES devices (default 3).
+ * Counting is stateless so a Render restart cannot reset it: Gumroad's own use counter holds the number of
+ * activated devices, and each activated browser keeps a signed device token (HMAC, 400 days). A browser that
+ * already holds a valid token for the key is not counted again. A 4th new device is refused. */
+const LIBRARY_DEVICES = parseInt(process.env.LIBRARY_DEVICES || '3', 10);
+const LIB_SECRET = process.env.LIBRARY_TOKEN_SECRET || process.env.FEDERATION_OWNER_TOKEN || process.env.OWNER_TOKEN || '';
+const hmac = (s) => require('crypto').createHmac('sha256', LIB_SECRET).update(s).digest('hex').slice(0, 32);
+function deviceToken(key) { const exp = Date.now() + 400 * 86400000; const body = sha(key) + '.' + exp; return body + '.' + hmac(body); }
+function deviceOk(key, tok) {
+  if (!LIB_SECRET || !tok) return false;
+  const p = String(tok).split('.'); if (p.length !== 3 || p[0] !== sha(key) || !(parseInt(p[1], 10) > Date.now())) return false;
+  const want = hmac(p[0] + '.' + p[1]); return want.length === p[2].length && require('crypto').timingSafeEqual(Buffer.from(want), Buffer.from(p[2]));
+}
+async function gumroadVerify(key, increment) {
+  const r = await fetch((process.env.GUMROAD_VERIFY_URL || 'https://api.gumroad.com/v2/licenses/verify'), {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ product_permalink: LIBRARY_PRODUCT, license_key: key, increment_uses_count: increment ? 'true' : 'false' })
+  });
+  if (r.status !== 200) return null;
+  const d = await r.json();
+  if (!d || !d.success) return null;
+  const pu = d.purchase || {};
+  if (pu.refunded || pu.chargebacked || pu.disputed) return null;
+  return { uses: parseInt(d.uses, 10) || 0 };
+}
+/* returns {ok:true, device?} | {ok:false, reason:'bad'|'devices'} */
+async function verifyLibraryCode(code, devTok) {
   const key = String(code || '').trim();
-  if (!LIBRARY_PRODUCT || key.length < 8 || key.length > 80 || !/^[A-Za-z0-9\-_]+$/.test(key)) return false;
+  if (!LIBRARY_PRODUCT || key.length < 8 || key.length > 80 || !/^[A-Za-z0-9\-_]+$/.test(key)) return { ok: false, reason: 'bad' };
   const h = sha(key);
   const hit = libCodeCache.get(h);
-  if (hit && hit > Date.now()) return true;
+  if (hit && hit > Date.now() && deviceOk(key, devTok)) return { ok: true };
   try {
-    const r = await fetch((process.env.GUMROAD_VERIFY_URL || 'https://api.gumroad.com/v2/licenses/verify'), {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ product_permalink: LIBRARY_PRODUCT, license_key: key, increment_uses_count: 'false' })
-    });
-    if (r.status !== 200) return false;
-    const d = await r.json();
-    if (!d || !d.success) return false;
-    const pu = d.purchase || {};
-    if (pu.refunded || pu.chargebacked || pu.disputed) return false;
+    const v = await gumroadVerify(key, false);
+    if (!v) return { ok: false, reason: 'bad' };
+    if (deviceOk(key, devTok)) { libCodeCache.set(h, Date.now() + 10 * 60 * 1000); return { ok: true, device: deviceToken(key) }; }
+    if (!LIB_SECRET) return { ok: true };
+    if (v.uses >= LIBRARY_DEVICES) return { ok: false, reason: 'devices' };
+    const v2 = await gumroadVerify(key, true);
+    if (!v2) return { ok: false, reason: 'bad' };
     libCodeCache.set(h, Date.now() + 10 * 60 * 1000);
-    return true;
-  } catch (e) { return false; }
+    return { ok: true, device: deviceToken(key) };
+  } catch (e) { return { ok: false, reason: 'bad' }; }
 }
 app.post('/library/inquire', async (req, res) => {
   if (isOwner(req)) return res.json({ unlimited: true, owner: true });
   const code = (req.body && req.body.code) || '';
   if (code) {
-    if (await verifyLibraryCode(code)) return res.json({ unlimited: true });
-    if (!LIBRARY_PRODUCT) return res.status(401).json({ error: 'codes_not_on_sale', message: 'Library codes are not on sale yet. The free YAML files are always available to download.' });
-    return res.status(401).json({ error: 'bad_code', message: 'That library code was not accepted. Check it, or download the free YAML.' });
+    if (!LIBRARY_PRODUCT) return res.status(401).json({ error: 'codes_not_on_sale', message: 'Supporter Keys are coming soon. The free YAML files are always available to download.' });
+    const v = await verifyLibraryCode(code, req.get('x-library-device') || '');
+    if (v.ok) return res.json({ unlimited: true, device: v.device || undefined });
+    if (v.reason === 'devices') return res.status(403).json({ error: 'device_limit', message: 'This Supporter Key is already used on ' + LIBRARY_DEVICES + ' devices. Write to keywebco@gmail.com and we will help.' });
+    return res.status(401).json({ error: 'bad_code', message: 'That Supporter Key was not accepted. Check it, or download the free YAML.' });
   }
   const ip = clientIp(req), d = today();
   let u = libUse.get(ip);
   if (!u || u.day !== d) { u = { day: d, n: 0 }; libUse.set(ip, u); }
   if (libUse.size > 20000) { for (const [k, v] of libUse) if (v.day !== d) libUse.delete(k); }
   if (u.n >= LIBRARY_FREE) {
-    return res.status(402).json({ error: 'free_limit', message: 'Your ' + LIBRARY_FREE + ' free inquiries are used. Enter a library code, or download the free YAML.', limit: LIBRARY_FREE, remaining: 0, codesOnSale: !!LIBRARY_PRODUCT });
+    return res.status(402).json({ error: 'free_limit', message: 'Your ' + LIBRARY_FREE + ' free inquiries are used. Enter your Supporter Key, or download the free YAML.', limit: LIBRARY_FREE, remaining: 0, codesOnSale: !!LIBRARY_PRODUCT });
   }
   u.n += 1;
   return res.json({ limit: LIBRARY_FREE, used: u.n, remaining: LIBRARY_FREE - u.n });
