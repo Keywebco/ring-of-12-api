@@ -310,7 +310,7 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'Ring of 12',
-    endpoints: ['/ask', '/single', '/log', '/quota', '/complete', '/council'],
+    endpoints: ['/ask', '/single', '/log', '/quota', '/complete', '/council', '/library/inquire'],
     freeLimit: FREE_LIMIT,
     llmConfigured: !!LLM_API_KEY
   });
@@ -460,6 +460,56 @@ app.post('/council', gate('ask'), async (req, res) => {
     console.error('Council error:', err.status || '', err.detail || err.message || err);
     return res.status(502).json({ error: 'The Council could not convene. Try again.' });
   }
+});
+
+
+/* ── Living Library gate ─────────────────────────────────────────────────────
+ * POST /library/inquire  body {code?}  header x-owner-token optional.
+ * Counts full-text inquiries per visitor (server-side, per IP, per day). The first LIBRARY_FREE are free.
+ * After that a library code is needed. The code is a Gumroad license key for the product named in
+ * LIBRARY_PRODUCT_PERMALINK, verified with Gumroad on every new key (cached 10 minutes). Nothing secret is on the page.
+ * If LIBRARY_PRODUCT_PERMALINK is not set, the paid path is closed and the reply says so plainly. */
+const LIBRARY_FREE = parseInt(process.env.LIBRARY_FREE || '3', 10);
+const LIBRARY_PRODUCT = process.env.LIBRARY_PRODUCT_PERMALINK || '';
+const libUse = new Map();
+const libCodeCache = new Map();
+async function verifyLibraryCode(code) {
+  const key = String(code || '').trim();
+  if (!LIBRARY_PRODUCT || key.length < 8 || key.length > 80 || !/^[A-Za-z0-9\-_]+$/.test(key)) return false;
+  const h = sha(key);
+  const hit = libCodeCache.get(h);
+  if (hit && hit > Date.now()) return true;
+  try {
+    const r = await fetch((process.env.GUMROAD_VERIFY_URL || 'https://api.gumroad.com/v2/licenses/verify'), {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ product_permalink: LIBRARY_PRODUCT, license_key: key, increment_uses_count: 'false' })
+    });
+    if (r.status !== 200) return false;
+    const d = await r.json();
+    if (!d || !d.success) return false;
+    const pu = d.purchase || {};
+    if (pu.refunded || pu.chargebacked || pu.disputed) return false;
+    libCodeCache.set(h, Date.now() + 10 * 60 * 1000);
+    return true;
+  } catch (e) { return false; }
+}
+app.post('/library/inquire', async (req, res) => {
+  if (isOwner(req)) return res.json({ unlimited: true, owner: true });
+  const code = (req.body && req.body.code) || '';
+  if (code) {
+    if (await verifyLibraryCode(code)) return res.json({ unlimited: true });
+    if (!LIBRARY_PRODUCT) return res.status(401).json({ error: 'codes_not_on_sale', message: 'Library codes are not on sale yet. The free YAML files are always available to download.' });
+    return res.status(401).json({ error: 'bad_code', message: 'That library code was not accepted. Check it, or download the free YAML.' });
+  }
+  const ip = clientIp(req), d = today();
+  let u = libUse.get(ip);
+  if (!u || u.day !== d) { u = { day: d, n: 0 }; libUse.set(ip, u); }
+  if (libUse.size > 20000) { for (const [k, v] of libUse) if (v.day !== d) libUse.delete(k); }
+  if (u.n >= LIBRARY_FREE) {
+    return res.status(402).json({ error: 'free_limit', message: 'Your ' + LIBRARY_FREE + ' free inquiries are used. Enter a library code, or download the free YAML.', limit: LIBRARY_FREE, remaining: 0, codesOnSale: !!LIBRARY_PRODUCT });
+  }
+  u.n += 1;
+  return res.json({ limit: LIBRARY_FREE, used: u.n, remaining: LIBRARY_FREE - u.n });
 });
 
 /* ── Anonymous feedback intake ── */
