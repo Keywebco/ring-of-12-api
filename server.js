@@ -593,6 +593,125 @@ app.post('/log', (req, res) => {
   });
 });
 
+
+/* ============================================================================================
+ * COMMAND PAGE (Builder). Roger, or a representative he has authorized, types what they want.
+ * Stage 1 /build/plan    : MiMo restates the order and lists the files it would touch. Writes nothing.
+ * Stage 2 /build/confirm : the person confirms the plan.
+ * Stage 3 /build/make    : MiMo writes the files; the server commits them to a REVIEW BRANCH only.
+ * Safety: refuses every call without a valid authorized token; refuses to ever write to main/master or
+ * any branch not named build/*; only repos in BUILD_REPOS; daily spend cap; every request logged.
+ * Tokens: BUILD_TOKENS = JSON {"roger":{"token":"...","on":true},"catalyst":{...},"muse":{"token":"...","on":false}}
+ * (the Owner token also works and is always on). Merging to live is NOT possible here by design.
+ * ============================================================================================ */
+const BUILD_REPOS = (process.env.BUILD_REPOS || 'Keywebco/nextxus-humancodex,Keywebco/keywebco.github.io,Keywebco/nextxus-agent-zero,Keywebco/nextxus-research-hub,Keywebco/nextxus-recycler,Keywebco/nextxus-archives,Keywebco/nextxus-senate,Keywebco/nextxus-chat,Keywebco/nextxus-tools,Keywebco/nextxus-blog').split(',').map(s => s.trim()).filter(Boolean);
+const BUILD_DAILY_CAP = parseInt(process.env.BUILD_DAILY_CAP || '30', 10);   /* model calls per day */
+const BUILD_MODEL = process.env.BUILD_MODEL || 'mimo-v2.6-pro';
+const BUILD_BASE = (process.env.BUILD_LLM_BASE || process.env.LLM_BASE_URL || 'https://api.xiaomimimo.com').replace(/\/v1\/?$/,'').replace(/\/$/,'');
+const BUILD_KEY = () => process.env.BUILD_MIMO_KEY || process.env.MIMO_API_KEY_CATALYST || process.env.MIMO_API_KEY || process.env.LLM_API_KEY || '';
+const GH_TOKEN = () => process.env.BUILD_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
+const buildLog = [];                      /* last 200 requests, in memory; the permanent log is the commit messages */
+const buildPlans = new Map();             /* planId -> {who, repo, files, order, at, confirmed} */
+let buildCalls = { day: '', n: 0 };
+function whoIs(req) {
+  const tok = (req.get('x-build-token') || '').trim();
+  if (!tok) return null;
+  const eq = (a, b) => a && b && a.length === b.length && require('crypto').timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  if (OWNER_TOKEN && eq(tok, OWNER_TOKEN)) return 'roger';
+  let reps = {}; try { reps = JSON.parse(process.env.BUILD_TOKENS || '{}'); } catch (e) {}
+  for (const k of Object.keys(reps)) { const r = reps[k]; if (r && r.on === true && eq(tok, String(r.token || ''))) return k; }
+  return null;
+}
+function note(who, what, extra) { buildLog.push(Object.assign({ at: new Date().toISOString(), who, what }, extra || {})); if (buildLog.length > 200) buildLog.shift(); }
+function underCap() { const d = new Date().toISOString().slice(0, 10); if (buildCalls.day !== d) buildCalls = { day: d, n: 0 }; if (buildCalls.n >= BUILD_DAILY_CAP) return false; buildCalls.n++; return true; }
+async function mimo(system, user, maxTokens) {
+  const r = await fetch(BUILD_BASE + '/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + BUILD_KEY(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: BUILD_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], max_tokens: maxTokens || 6000, temperature: 0.2 }) });
+  if (!r.ok) throw new Error('model ' + r.status);
+  const d = await r.json(); const c = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+  if (!c) throw new Error('empty model reply'); return c;
+}
+async function gh(method, url, body) {
+  const r = await fetch('https://api.github.com' + url, { method, headers: { 'Authorization': 'Bearer ' + GH_TOKEN(), 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'nextxus-command-page' }, body: body ? JSON.stringify(body) : undefined });
+  const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
+  return { status: r.status, json: j };
+}
+const safePath = (p) => typeof p === 'string' && p.length < 160 && !p.startsWith('/') && !p.includes('..') && !/^\.git(\/|$)/.test(p) && /^[A-Za-z0-9._\-\/]+$/.test(p);
+function jsonFrom(text) { const m = text.match(/\{[\s\S]*\}/); if (!m) throw new Error('no JSON in model reply'); return JSON.parse(m[0]); }
+
+app.get('/build/status', (req, res) => {
+  const who = whoIs(req); if (!who) return res.status(401).json({ error: 'not_authorized', message: 'This page only takes orders from Roger or a representative he has authorized.' });
+  res.json({ ok: true, who, repos: BUILD_REPOS, callsToday: buildCalls.day === new Date().toISOString().slice(0, 10) ? buildCalls.n : 0, dailyCap: BUILD_DAILY_CAP, canWrite: !!GH_TOKEN(), canThink: !!BUILD_KEY(), recent: buildLog.slice(-15) });
+});
+
+app.post('/build/plan', async (req, res) => {
+  const who = whoIs(req); if (!who) { note('unknown', 'refused: no valid token'); return res.status(401).json({ error: 'not_authorized' }); }
+  const { repo, order } = req.body || {};
+  if (!BUILD_REPOS.includes(repo)) return res.status(400).json({ error: 'repo_not_allowed', allowed: BUILD_REPOS });
+  if (typeof order !== 'string' || order.trim().length < 5 || order.length > 4000) return res.status(400).json({ error: 'bad_order' });
+  if (!GH_TOKEN() || !BUILD_KEY()) return res.status(503).json({ error: 'not_configured' });
+  if (!underCap()) return res.status(429).json({ error: 'daily_cap', message: 'Today\'s model budget for the command page is used up. It resets at midnight UTC.' });
+  try {
+    const tree = await gh('GET', '/repos/' + repo + '/git/trees/main?recursive=1');
+    if (tree.status !== 200) return res.status(502).json({ error: 'github_read_failed', status: tree.status });
+    const files = (tree.json.tree || []).filter(f => f.type === 'blob' && f.size < 400000 && /\.(html|css|js|md|json|yaml|yml|txt)$/i.test(f.path)).map(f => f.path).slice(0, 400);
+    const sys = 'You are the foreman for a website builder. A person gives you an order that may be garbled or voice-dictated. Do NOT build anything yet. Reply with ONLY a JSON object: {"understood":"one plain sentence restating exactly what you think they want","questions":["only if something truly cannot be guessed, else empty"],"files":["existing file paths you would edit or new file paths you would create, chosen only from or beside the file list"],"steps":["short plain steps"],"risk":"low|medium|high with a few words"}. Never include more than 8 files.';
+    const raw = await mimo(sys, 'REPO: ' + repo + '\nFILES:\n' + files.join('\n') + '\n\nORDER:\n' + order.trim(), 3000);
+    const plan = jsonFrom(raw);
+    plan.files = Array.from(new Set((plan.files || []).filter(safePath))).slice(0, 8);
+    const id = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    buildPlans.set(id, { who, repo, order: order.trim(), plan, at: Date.now(), confirmed: false });
+    if (buildPlans.size > 50) buildPlans.delete(buildPlans.keys().next().value);
+    note(who, 'plan', { repo, id });
+    res.json({ planId: id, understood: plan.understood, questions: plan.questions || [], files: plan.files, steps: plan.steps || [], risk: plan.risk || '' });
+  } catch (e) { note(who, 'plan failed', { err: String(e.message).slice(0, 120) }); res.status(502).json({ error: 'plan_failed', message: 'The planning step failed. Nothing was changed.' }); }
+});
+
+app.post('/build/confirm', (req, res) => {
+  const who = whoIs(req); if (!who) return res.status(401).json({ error: 'not_authorized' });
+  const p = buildPlans.get((req.body || {}).planId);
+  if (!p) return res.status(404).json({ error: 'no_such_plan', message: 'That plan has expired. Ask again.' });
+  if (p.who !== who && who !== 'roger') return res.status(403).json({ error: 'not_your_plan' });
+  p.confirmed = true; note(who, 'confirmed', { id: req.body.planId }); res.json({ ok: true });
+});
+
+app.post('/build/make', async (req, res) => {
+  const who = whoIs(req); if (!who) { note('unknown', 'refused: no valid token'); return res.status(401).json({ error: 'not_authorized' }); }
+  const p = buildPlans.get((req.body || {}).planId);
+  if (!p) return res.status(404).json({ error: 'no_such_plan' });
+  if (!p.confirmed) return res.status(409).json({ error: 'not_confirmed', message: 'Confirm the plan first. Nothing is written until you do.' });
+  if (p.done) return res.status(409).json({ error: 'already_made', branch: p.done });
+  if (!underCap()) return res.status(429).json({ error: 'daily_cap' });
+  const repo = p.repo;
+  try {
+    const cur = [];
+    for (const f of p.plan.files) {
+      const r = await gh('GET', '/repos/' + repo + '/contents/' + encodeURI(f) + '?ref=main');
+      if (r.status === 200 && r.json && r.json.content) cur.push({ path: f, content: Buffer.from(r.json.content, 'base64').toString('utf8') }); else cur.push({ path: f, content: null });
+    }
+    const sys = 'You write website files. Plain HTML, CSS and vanilla JS only, readable without JavaScript. Make ONLY the change that was ordered; keep everything else exactly as is. Reply with ONLY a JSON object: {"files":[{"path":"...","content":"FULL new file content"}],"summary":"one plain sentence of what changed"}. Only paths from the allowed list. Never output secrets.';
+    const user = 'ORDER:\n' + p.order + '\n\nUNDERSTOOD:\n' + p.plan.understood + '\n\nALLOWED PATHS:\n' + p.plan.files.join('\n') + '\n\nCURRENT FILES:\n' + cur.map(c => '=== ' + c.path + (c.content === null ? ' (NEW FILE)' : '') + ' ===\n' + (c.content || '')).join('\n\n');
+    const out = jsonFrom(await mimo(sys, user, 12000));
+    const edits = (out.files || []).filter(f => f && safePath(f.path) && p.plan.files.includes(f.path) && typeof f.content === 'string' && f.content.length > 0 && f.content.length < 600000);
+    if (!edits.length) return res.status(502).json({ error: 'no_valid_edits', message: 'The model returned nothing usable. Nothing was changed.' });
+    /* every file must look intact: an edit that shrinks an existing file by more than 60% is refused */
+    for (const e of edits) { const c = cur.find(x => x.path === e.path); if (c && c.content && e.content.length < c.content.length * 0.4) return res.status(502).json({ error: 'edit_too_destructive', file: e.path, message: 'The model tried to remove most of ' + e.path + '. Refused, nothing was changed.' }); }
+    const base = await gh('GET', '/repos/' + repo + '/git/ref/heads/main');
+    if (base.status !== 200) return res.status(502).json({ error: 'github_read_failed' });
+    const branch = 'build/' + who + '-' + new Date().toISOString().slice(0, 10) + '-' + Math.random().toString(36).slice(2, 6);
+    if (!/^build\/[a-z0-9\-]+$/.test(branch)) return res.status(500).json({ error: 'bad_branch' });
+    const mk = await gh('POST', '/repos/' + repo + '/git/refs', { ref: 'refs/heads/' + branch, sha: base.json.object.sha });
+    if (mk.status !== 201) return res.status(502).json({ error: 'branch_failed', status: mk.status });
+    for (const e of edits) {
+      const ex = await gh('GET', '/repos/' + repo + '/contents/' + encodeURI(e.path) + '?ref=' + branch);
+      const put = await gh('PUT', '/repos/' + repo + '/contents/' + encodeURI(e.path), { message: 'Command page (' + who + '): ' + String(out.summary || p.order).slice(0, 140), content: Buffer.from(e.content, 'utf8').toString('base64'), branch, sha: ex.status === 200 ? ex.json.sha : undefined });
+      if (put.status !== 200 && put.status !== 201) return res.status(502).json({ error: 'write_failed', file: e.path, status: put.status, branch });
+    }
+    p.done = branch; note(who, 'made', { repo, branch, files: edits.map(e => e.path) });
+    res.json({ ok: true, branch, repo, files: edits.map(e => e.path), summary: out.summary || '', review: 'https://github.com/' + repo + '/compare/main...' + branch, note: 'Nothing is live. Review the branch, then Roger says merge.' });
+  } catch (e) { note(who, 'make failed', { err: String(e.message).slice(0, 120) }); res.status(502).json({ error: 'make_failed', message: 'The build failed. Nothing was merged to live.' }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Ring of 12 API listening on port ${PORT}`);
 });
