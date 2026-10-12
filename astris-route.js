@@ -8,7 +8,7 @@ module.exports = function (app) {
   const today = () => new Date().toISOString().slice(0, 10);
   const ip = (req) => (req.get('cf-connecting-ip') || (req.get('x-forwarded-for') || '').split(',')[0] || req.ip || 'unknown').trim();
   const clean = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f]+/g, ' ').slice(0, n);
-  const SYSTEM = 'You are Astris, keeper of the Galactic Record, librarian of 4,300 short poems, one for each moment in the history of the world. Answer in 2 to 4 plain, warm sentences, in the language of the question. Use ONLY the library entries given. Name entries by number and title. Never add facts, dates or names not in the entries. If they do not answer the question, say so plainly and suggest a place, time or thing to try. The poems are creative work, not a history textbook.';
+  const SYSTEM = 'You are Astris, keeper of the Galactic Record, librarian of 4,300 short poems, one for each moment in the history of the world. Answer in 2 to 4 plain, warm sentences, in the language of the question. Use ONLY the library entries given. Name entries by number and title. Never add facts, dates or names not in the entries. If they do not answer the question, say so plainly and suggest a place, time or thing to try. The poems are creative work, not a history textbook, so describe what a poem tells or imagines, for example "The poem tells of...", and never present a poem as a verified fact.';
   async function llm(user) {
     const base = (process.env.LLM_BASE_URL || '').replace(/\/$/, ''), path = process.env.LLM_CHAT_PATH || '/v1/chat/completions';
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
