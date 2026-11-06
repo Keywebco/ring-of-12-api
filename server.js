@@ -356,7 +356,7 @@ app.post('/ask', gate('ask'), async (req, res) => {
   }
 
   try {
-    const raw = await callLLM(SYSTEM_PROMPT, question.trim(), { temperature: 0.8, maxTokens: 3000 });
+    const raw = await callLLM(SYSTEM_PROMPT, question.trim(), { temperature: 0.8, maxTokens: 8000 });
 
     let parsed;
     try {
