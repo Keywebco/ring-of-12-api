@@ -1,0 +1,18 @@
+# Federation update timer. Free, built into GitHub. No keys, no always-on computer.
+# Once a week, GitHub looks for newer versions of this service's software parts
+# and opens a pull request that suggests the update. That is all it does.
+# Nothing is merged automatically. The live copy (main) only changes if Roger
+# Keyserling says yes and someone merges the pull request by hand.
+# Set up 2026-11-20 with Roger's spoken yes (5:59 PM Central).
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Chicago"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "Suggested update, waiting for Roger's yes"
