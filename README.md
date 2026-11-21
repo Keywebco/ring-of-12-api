@@ -6,7 +6,7 @@ This is a backend API, not a website — there is no GitHub Pages site.
 
 ## Live service
 
-Deployed on Render via `render.yaml` (web service `ring-of-12-api`, Node runtime, `npm install` build, `node server.js` start, port 3000). Requires the `LLM_API_KEY` environment variable (the Emergent universal key; `EMERGENT_LLM_KEY` is kept only as a legacy name).
+Deployed on Render via `render.yaml` (web service `ring-of-12-api`, Node runtime, `npm install` build, `node server.js` start, port 3000). Requires the `LLM_API_KEY` environment variable for the primary provider (intended: MiMo), with Fireworks as an optional backup. Emergent is not used.
 
 ## What's here
 

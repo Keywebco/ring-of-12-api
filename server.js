@@ -3,11 +3,11 @@
  *
  * render.yaml-compatible env vars (Render.com → service → Environment):
  *
- *   LLM_API_KEY   (REQUIRED)  Emergent LLM API key.
+ *   LLM_API_KEY   (REQUIRED)  Primary LLM provider key (intended: MiMo).
  *                 The key previously committed to this repo is LEAKED in the
- *                 public git history and MUST be rotated: revoke it in the
- *                 Emergent dashboard, generate a new key, and set it here.
- *                 Never commit an API key to the repo again.
+ *                 public git history and MUST be rotated: revoke the old key,
+ *                 generate a new one, and set it here. Never commit an API key
+ *                 to the repo again.
  *
  *   PORT          (optional)  Set automatically by Render. Defaults to 3000
  *                 for local development.
@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 3000;
 const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://integrations.emergentagent.com/llm';
 
 /* REQUIRED — never hardcode the key in this file. See header note about the
- * previously leaked key: it must be rotated in the Emergent dashboard. */
+ * previously leaked key: it must be rotated and must not be reused. */
 const LLM_API_KEY = process.env.LLM_API_KEY || '';
 const LLM_MODEL = process.env.LLM_MODEL || 'gpt-4o-mini';
 /* LLM_CHAT_PATH lets the same server talk to any OpenAI-compatible provider (MiMo uses /v1/chat/completions). */
@@ -112,7 +112,8 @@ const SINGLE_SYSTEM_PROMPT = 'Answer the question directly in 3-4 sentences, sin
 /* ── Shared LLM call, with automatic fallback ──────────────────────────────
  * Providers are tried in order. Any failure (network error, non-200, empty reply, timeout)
  * moves on to the next one, so a visitor only sees an error when EVERY provider is down.
- * Order: 1) MiMo (the free primary)  2) Fireworks (prepaid backup)  3) Emergent (kept as the last backup).
+ * Order: 1) primary (LLM_API_KEY, intended to be MiMo)  2) Fireworks (prepaid backup).
+ * Emergent is not used.
  * A provider is skipped when its key is not set. Keys are read from environment variables only.
  * The last provider that answered is exposed as lastProvider for health checks. */
 function buildProviders() {
@@ -122,9 +123,6 @@ function buildProviders() {
   }
   if (process.env.FIREWORKS_API_KEY) {
     list.push({ name: 'fireworks', base: 'https://api.fireworks.ai/inference', path: '/v1/chat/completions', key: process.env.FIREWORKS_API_KEY, model: process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/gpt-oss-120b' });
-  }
-  if (process.env.EMERGENT_LLM_KEY) {
-    list.push({ name: 'emergent', base: 'https://integrations.emergentagent.com/llm', path: '/v1/chat/completions', key: process.env.EMERGENT_LLM_KEY, model: 'gpt-4o-mini' });
   }
   return list;
 }
