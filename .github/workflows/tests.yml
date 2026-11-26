@@ -1,0 +1,29 @@
+# Federation test timer (EE-2026-11-20-001). Free, built into GitHub.
+# Runs this service's own tests on every pull request and every change to main.
+# It only reads and reports. It never merges, deploys, or changes anything.
+# A red result means: do not merge until someone looks. Merges still need
+# Roger Keyserling's spoken merge word.
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Unit tests (no keys needed)
+        run: npm test
